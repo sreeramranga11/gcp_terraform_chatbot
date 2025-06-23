@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+requests
+google-cloud-aiplatform
+google-cloud-secret-manager
+google-cloud-logging
+google-cloud-bigquery
+PyGithub
+python-dotenv 
