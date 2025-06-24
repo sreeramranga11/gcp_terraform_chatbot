@@ -26,9 +26,18 @@ class ApprovalRequest(BaseModel):
 def call_vertex_ai(prompt: str) -> str:
     vertexai.init(project=PROJECT_ID, location=REGION)
     model = GenerativeModel("gemini-2.0-flash-lite-001")
-    response = model.generate_content(prompt)
+    # Compose a better prompt
+    full_prompt = (
+        f"Generate a concise summary (1-2 sentences) in plain English describing the requested GCP infrastructure change, "
+        f"and then provide only the Terraform code block to accomplish it. "
+        f"User request: {prompt}\n"
+        f"Format your response as:\n"
+        f"Summary: <summary here>\n"
+        f"Terraform:\n```hcl\n<terraform code here>\n```\n"
+        f"Do not include bash scripts, gcloud commands, or lengthy explanations."
+    )
+    response = model.generate_content(full_prompt)
     return response.text
-
 @app.get("/health")
 def health():
     return {"status": "ok"}
