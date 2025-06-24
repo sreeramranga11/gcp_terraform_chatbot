@@ -2,12 +2,29 @@ import React, { useState } from 'react';
 import axios from 'axios';
 
 function parseBotResponse(response) {
-  // Try to split the response into summary and terraform code
-  const summaryMatch = response.match(/Summary:(.*?)(Terraform:|$)/s);
-  const terraformMatch = response.match(/Terraform:\s*```hcl([\s\S]*?)```/);
-  const summary = summaryMatch ? summaryMatch[1].trim() : null;
-  const terraform = terraformMatch ? terraformMatch[1].trim() : null;
-  return { summary, terraform };
+  // Extract summary
+  let summary = null;
+  let change = null;
+
+  // Match summary between 'Summary:' and 'Change:'
+  const summaryMatch = response.match(/Summary:(.*?)(Change:|$)/s);
+  if (summaryMatch) {
+    summary = summaryMatch[1].replace(/\n/g, ' ').trim();
+  }
+
+  // Match diff code block after 'Change:'
+  const diffMatch = response.match(/Change:\s*```diff([\s\S]*?)```/);
+  if (diffMatch) {
+    change = diffMatch[1].trim();
+  } else {
+    // fallback: match any diff code block
+    const fallbackDiff = response.match(/```diff([\s\S]*?)```/);
+    if (fallbackDiff) {
+      change = fallbackDiff[1].trim();
+    }
+  }
+
+  return { summary, change };
 }
 
 function App() {
@@ -21,11 +38,11 @@ function App() {
     if (!input.trim()) return;
     setMessages([...messages, { sender: 'user', text: input }]);
     const res = await axios.post('/chat', { message: input, user_id });
-    const { summary, terraform } = parseBotResponse(res.data.response);
-    if (summary || terraform) {
+    const { summary, change } = parseBotResponse(res.data.response);
+    if (summary || change) {
       setMessages(msgs => [
         ...msgs,
-        { sender: 'bot', summary, terraform, text: res.data.response, showApproval: true }
+        { sender: 'bot', summary, change, text: res.data.response, showApproval: true }
       ]);
       setAwaitingApproval(true);
     } else {
@@ -50,13 +67,26 @@ function App() {
         {messages.map((msg, i) => (
           <div key={i} style={{ textAlign: msg.sender === 'user' ? 'right' : 'left', marginBottom: 16 }}>
             <b>{msg.sender === 'user' ? 'You' : 'Bot'}:</b>
-            {msg.sender === 'bot' && (msg.summary || msg.terraform) ? (
+            {msg.sender === 'bot' && (msg.summary || msg.change) ? (
               <div>
                 {msg.summary && <div style={{ margin: '8px 0', color: '#333' }}><b>Summary:</b> {msg.summary}</div>}
-                {msg.terraform && (
+                {msg.change && (
                   <div style={{ margin: '8px 0' }}>
-                    <b>Terraform:</b>
-                    <pre style={{ background: '#f4f4f4', padding: 10, borderRadius: 4, overflowX: 'auto' }}>{msg.terraform}</pre>
+                    <b>Change:</b>
+                    <pre style={{ background: '#f4f4f4', padding: 10, borderRadius: 4, overflowX: 'auto' }}>
+                      {msg.change.split('\n').map((line, idx) => {
+                        let color = '#222';
+                        if (line.startsWith('+')) color = '#22863a'; // green
+                        else if (line.startsWith('-')) color = '#cb2431'; // red
+                        else if (line.startsWith('@@')) color = '#6f42c1'; // purple for hunk headers
+                        return (
+                          <span key={idx} style={{ color }}>
+                            {line}
+                            {'\n'}
+                          </span>
+                        );
+                      })}
+                    </pre>
                   </div>
                 )}
                 {msg.showApproval && i === messages.length - 1 && awaitingApproval && (
