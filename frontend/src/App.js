@@ -61,7 +61,7 @@ function App() {
                 )}
                 {msg.showApproval && i === messages.length - 1 && awaitingApproval && (
                   <div style={{ marginTop: 10 }}>
-                    <button onClick={() => handleApproval('approve')} style={{ marginRight: 8, padding: '6px 16px', background: '#4caf50', color: 'white', border: 'none', borderRadius: 4 }}>Approve</button>
+                    <button onClick={() => handleApproval('approve')} style={{ marginRight: 8, padding: '6px 16px', background: '#4caf50', color: 'white', border: 'none', borderRadius: 4 }}>Create New Branch</button>
                     <button onClick={() => handleApproval('reject')} style={{ padding: '6px 16px', background: '#f44336', color: 'white', border: 'none', borderRadius: 4 }}>Reject</button>
                   </div>
                 )}
