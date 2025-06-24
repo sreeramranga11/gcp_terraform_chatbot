@@ -13,21 +13,34 @@ function parseBotResponse(response) {
 function App() {
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState('');
+  const [awaitingApproval, setAwaitingApproval] = useState(false);
+
+  const user_id = 'demo';
 
   const sendMessage = async () => {
     if (!input.trim()) return;
     setMessages([...messages, { sender: 'user', text: input }]);
-    const res = await axios.post('/chat', { message: input, user_id: 'demo' });
+    const res = await axios.post('/chat', { message: input, user_id });
     const { summary, terraform } = parseBotResponse(res.data.response);
     if (summary || terraform) {
       setMessages(msgs => [
         ...msgs,
-        { sender: 'bot', summary, terraform, text: res.data.response }
+        { sender: 'bot', summary, terraform, text: res.data.response, showApproval: true }
       ]);
+      setAwaitingApproval(true);
     } else {
       setMessages(msgs => [...msgs, { sender: 'bot', text: res.data.response }]);
     }
     setInput('');
+  };
+
+  const handleApproval = async (action) => {
+    setAwaitingApproval(false);
+    const res = await axios.post('/approve', { user_id, action });
+    setMessages(msgs => [
+      ...msgs,
+      { sender: 'bot', text: res.data.result }
+    ]);
   };
 
   return (
@@ -44,6 +57,12 @@ function App() {
                   <div style={{ margin: '8px 0' }}>
                     <b>Terraform:</b>
                     <pre style={{ background: '#f4f4f4', padding: 10, borderRadius: 4, overflowX: 'auto' }}>{msg.terraform}</pre>
+                  </div>
+                )}
+                {msg.showApproval && i === messages.length - 1 && awaitingApproval && (
+                  <div style={{ marginTop: 10 }}>
+                    <button onClick={() => handleApproval('approve')} style={{ marginRight: 8, padding: '6px 16px', background: '#4caf50', color: 'white', border: 'none', borderRadius: 4 }}>Approve</button>
+                    <button onClick={() => handleApproval('reject')} style={{ padding: '6px 16px', background: '#f44336', color: 'white', border: 'none', borderRadius: 4 }}>Reject</button>
                   </div>
                 )}
               </div>
