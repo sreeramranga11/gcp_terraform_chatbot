@@ -285,7 +285,29 @@ def parse_block_changes(response: str):
         changes[filename].append((block_id, block_content))
     return changes
 
-# Helper: replace or insert block in file content
+def find_block_span(file_content, block_header):
+    """
+    Returns (start, end) indices of the block in file_content, or None if not found.
+    """
+    import re
+    header_pattern = re.compile(re.escape(block_header) + r'\s*\{', re.MULTILINE)
+    match = header_pattern.search(file_content)
+    if not match:
+        return None
+    start = match.start()
+    i = match.end()  # position after the opening brace
+    depth = 1
+    while i < len(file_content):
+        if file_content[i] == '{':
+            depth += 1
+        elif file_content[i] == '}':
+            depth -= 1
+            if depth == 0:
+                return (start, i + 1)
+        i += 1
+    return None  # Block not closed properly
+
+
 def replace_or_insert_block(file_content, block_id, new_block):
     import re
     print(f"[DEBUG] Attempting to match block_id: {block_id}")
@@ -300,33 +322,26 @@ def replace_or_insert_block(file_content, block_id, new_block):
             type_name, name = m2.groups()
         else:
             print(f"[DEBUG] Could not parse block_id, using fallback.")
-            block_pattern = re.compile(
-                r'(resource|module|variable)\s+"[^\"]+"\s+"' + re.escape(block_id) + r'"\s*\{[\s\S]*?^[ \t]*\}',
-                re.MULTILINE
-            )
-            matches = list(block_pattern.finditer(file_content))
-            print(f"[DEBUG] Found {len(matches)} matches for block_id '{block_id}' (fallback)")
-            if matches:
-                start, end = matches[0].span()
-                new_content = file_content[:start] + new_block + '\n' + file_content[end:]
-                print(f"[DEBUG] Replaced block '{block_id}' in file (fallback).")
-                return new_content
-            else:
-                print(f"[DEBUG] Block '{block_id}' not found, inserting at end of file (fallback).")
-                return file_content.rstrip() + '\n\n' + new_block + '\n'
+            # fallback: try to find any block with block_id as name (regex, bracket counting)
+            block_header_pattern = re.compile(r'(resource|module|variable)\s+"[^"]+"\s+"' + re.escape(block_id) + r'"')
+            match = block_header_pattern.search(file_content)
+            if match:
+                block_header = match.group(0)
+                span = find_block_span(file_content, block_header)
+                if span:
+                    start, end = span
+                    new_content = file_content[:start] + new_block + '\n' + file_content[end:]
+                    print(f"[DEBUG] Replaced block '{block_id}' in file (fallback, bracket-counting).")
+                    return new_content
+            print(f"[DEBUG] Block '{block_id}' not found, inserting at end of file (fallback).")
+            return file_content.rstrip() + '\n\n' + new_block + '\n'
     block_header = f'{block_type} "{type_name}" "{name}"'
     print(f"[DEBUG] Looking for block header: {block_header}")
-    block_regex = (
-        rf'{block_type}\s+"{re.escape(type_name)}"\s+"{re.escape(name)}"\s*\{{[\s\S]*?^[ \t]*\}}'
-    )
-    print(f"[DEBUG] Using regex: {block_regex}")
-    block_pattern = re.compile(block_regex, re.MULTILINE)
-    matches = list(block_pattern.finditer(file_content))
-    print(f"[DEBUG] Found {len(matches)} matches for block_id '{block_id}'")
-    if matches:
-        start, end = matches[0].span()
+    span = find_block_span(file_content, block_header)
+    if span:
+        start, end = span
         new_content = file_content[:start] + new_block + '\n' + file_content[end:]
-        print(f"[DEBUG] Replaced block '{block_id}' in file.")
+        print(f"[DEBUG] Replaced block '{block_id}' in file (bracket-counting).")
         return new_content
     else:
         print(f"[DEBUG] Block '{block_id}' not found, inserting at end of file.")
