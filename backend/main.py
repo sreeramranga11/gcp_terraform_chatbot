@@ -52,64 +52,74 @@ def fetch_terraform_files():
             files.append({"path": f.path, "content": decoded.decode(errors='replace')})
     return files
 
-def call_vertex_ai_with_context(prompt: str, files: list) -> str:
+def call_vertex_ai(prompt: str) -> str:
     vertexai.init(project=PROJECT_ID, location=REGION)
     model = GenerativeModel("gemini-2.0-flash-lite-001")
+    response = model.generate_content(prompt)
+    return response.text
+
+def initial_summary_and_diff(user_prompt: str, files: list) -> str:
     context = "\n\n".join([f"File: {f['path']}\n{f['content']}" for f in files])
     full_prompt = (
         f"You are an expert DevOps assistant. Here is the current state of the infrastructure as Terraform files:\n"
         f"{context}\n\n"
-        f"User request: {prompt}\n\n"
-        f"Output ONLY a valid unified diff (as produced by `git diff`), suitable for direct application with `patch` or `git apply`. "
-        f"Do not omit any lines, hunk headers, or context. Do not include explanations, comments, or extra text.\n\n"
+        f"User request: {user_prompt}\n\n"
+        f"Output ONLY a concise summary and a valid unified diff (as from `git diff`).\n"
         f"Format your response as:\n"
         f"Summary: <summary here>\n"
         f"Change:\n```diff\n<diff or patch here>\n```\n\n"
-        f"For example, if the user request is \"Change the instance type from n1-standard-1 to n1-standard-2 in main.tf\", and the relevant lines in main.tf are:\n\n"
-        f"resource \"google_compute_instance\" \"default\" {{\n  name         = \"test\"\n  machine_type = \"n1-standard-1\"\n  ...\n}}\n\n"
-        f"The diff should look like:\n\n"
-        f"diff --git a/main.tf b/main.tf\nindex 1234567..89abcde 100644\n--- a/main.tf\n+++ b/main.tf\n@@ -2,7 +2,7 @@\n resource \"google_compute_instance\" \"default\" {{\n   name         = \"test\"\n-  machine_type = \"n1-standard-1\"\n+  machine_type = \"n1-standard-2\"\n   ...\n }}\n\n"
-        f"If multiple files are changed, include all changes in the same diff."
+        f"Do not include explanations, comments, or extra text."
     )
-    response = model.generate_content(full_prompt)
-    return response.text
+    return call_vertex_ai(full_prompt)
 
-def extract_change(response: str) -> str:
-    import re
-    # Try to extract diff from code block after Change:
-    match = re.search(r"Change:\s*```diff([\s\S]*?)```", response)
-    if match:
-        return match.group(1).strip()
-    # Fallback: try to extract any diff code block
-    match = re.search(r"```diff([\s\S]*?)```", response)
-    if match:
-        return match.group(1).strip()
-    # Fallback: try to extract a raw unified diff from the response
-    # Look for the first occurrence of a diff header
-    diff_start = re.search(r"^diff --git .*$|^--- a/.*$", response, re.MULTILINE)
-    if diff_start:
-        return response[diff_start.start():].strip()
-    # If nothing found, return empty string
-    return ""
+def cleanup_diff(diff: str) -> str:
+    prompt = (
+        f"Here is a proposed unified diff. Clean it up to ensure it is a valid, patchable unified diff, with correct headers, context lines, and no extra text. Output only the cleaned diff.\n"
+        f"```diff\n{diff}\n```"
+    )
+    return call_vertex_ai(prompt)
+
+def validate_and_fix_diff(diff: str, files: list) -> str:
+    context = "\n\n".join([f"File: {f['path']}\n{f['content']}" for f in files])
+    prompt = (
+        f"Here is the current state of the infrastructure as Terraform files:\n"
+        f"{context}\n\n"
+        f"Here is a unified diff:\n````diff\n{diff}\n````\n"
+        f"Is this diff valid and patchable? If not, fix it and output only the corrected diff. Output only the valid unified diff, nothing else."
+    )
+    return call_vertex_ai(prompt)
 
 def apply_diff_to_files(files, diff_text):
     """
     Apply a unified diff to a list of files (dicts with 'path' and 'content').
     Returns a dict of updated file contents {path: new_content}.
     """
+    print("[DEBUG] Raw diff_text received:")
+    print(diff_text)
     # Remove '\ No newline at end of file' lines
     diff_text = '\n'.join(line for line in diff_text.splitlines() if line.strip() != '\\ No newline at end of file')
     file_map = {f['path']: f['content'].splitlines(keepends=True) for f in files}
     updated_files = {path: ''.join(lines) for path, lines in file_map.items()}
+    print(f"[DEBUG] Files in repo context: {list(file_map.keys())}")
     patch = PatchSet(io.StringIO(diff_text))
+    diff_files = [patched_file.path for patched_file in patch]
+    print(f"[DEBUG] Files found in diff: {diff_files}")
     for patched_file in patch:
         # Remove a/ or b/ prefix for matching
         path = patched_file.path
         if path.startswith('a/') or path.startswith('b/'):
             path = path[2:]
         if path not in file_map:
+            print(f"[DEBUG] Creating new file from diff: {path}")
+            # New file: build content from added and context lines in the diff
+            new_lines = []
+            for hunk in patched_file:
+                for line in hunk:
+                    if line.is_added or line.is_context:
+                        new_lines.append(line.value)
+            updated_files[path] = ''.join(new_lines)
             continue
-        print(f"[DEBUG] File '{path}' has {len(file_map[path])} lines.")
+        print(f"[DEBUG] Updating existing file '{path}' with {len(file_map[path])} original lines.")
         for hunk in patched_file:
             print(f"[DEBUG] Hunk header: source_start={hunk.source_start}, source_length={hunk.source_length}, target_start={hunk.target_start}, target_length={hunk.target_length}")
         original = file_map[path]
@@ -133,6 +143,7 @@ def apply_diff_to_files(files, diff_text):
         # Add any remaining lines after the last hunk
         new_lines.extend(original[i:])
         updated_files[path] = ''.join(new_lines)
+    print(f"[DEBUG] Updated files to be returned: {list(updated_files.keys())}")
     return updated_files
 
 def parse_changed_files_and_summary(response: str):
@@ -160,36 +171,57 @@ def chat(req: ChatRequest):
     try:
         files = fetch_terraform_files()
         print(f"[DEBUG] Files fetched for context: {[f['path'] for f in files]}")
-        response = call_vertex_ai_with_context(req.message, files)
-        change = extract_change(response)
-        user_terraform_change[req.user_id] = change
+        response = initial_summary_and_diff(req.message, files)
+        print(f"[DEBUG] Initial model response (summary+diff):\n{response}")
+        # Extract summary and diff
+        import re
+        summary_match = re.search(r"Summary:(.*?)(Change:|$)", response, re.DOTALL)
+        summary = summary_match.group(1).strip() if summary_match else None
+        diff_match = re.search(r"Change:\s*```diff([\s\S]*?)```", response)
+        diff = diff_match.group(1).strip() if diff_match else None
+        print(f"[DEBUG] Extracted summary: {summary}")
+        print(f"[DEBUG] Extracted diff:\n{diff}")
+        user_terraform_change[req.user_id] = diff
         user_terraform_context[req.user_id] = files
-        return {"response": response}
+        user_terraform_summary = summary
+        return {"response": response, "summary": summary, "diff": diff}
     except Exception as e:
+        print(f"[ERROR] Exception in /chat: {e}")
         return {"response": f"Error: {str(e)}"}
 
 @app.post("/approve")
 def approve(req: ApprovalRequest):
     if req.action == "approve":
-        response = user_terraform_change.get(req.user_id)
+        diff = user_terraform_change.get(req.user_id)
         files = user_terraform_context.get(req.user_id)
-        if not response or not files:
+        if not diff or not files:
+            print("[DEBUG] No change or context found for this user.")
             return {"result": "No change or context found for this user. Please generate a change first."}
-        print(f"[DEBUG] Model response for user {req.user_id}:\n{response}")
+        print(f"[DEBUG] Initial diff for user {req.user_id}:\n{diff}")
+        # Step 2: Clean up diff
+        cleaned_diff = cleanup_diff(diff)
+        print(f"[DEBUG] Cleaned diff (after cleanup prompt):\n{cleaned_diff}")
+        # Step 3: Validate/fix diff
+        validated_diff = validate_and_fix_diff(cleaned_diff, files)
+        print(f"[DEBUG] Validated/fixed diff (after validation prompt):\n{validated_diff}")
+        # Step 4: Apply diff and push
         try:
-            summary, changed_files = parse_changed_files_and_summary(response)
-            if not changed_files:
-                return {"result": "No files to change. The model did not output any file changes.", "summary": summary}
+            print(f"[DEBUG] Applying validated diff to files...")
+            updated_files = apply_diff_to_files(files, validated_diff)
+            print(f"[DEBUG] Files after applying diff: {list(updated_files.keys())}")
         except Exception as e:
-            return {"result": f"Error parsing model response: {e}"}
+            print(f"[ERROR] Error applying diff: {e}")
+            return {"result": f"Error applying diff: {e}"}
         try:
+            print(f"[DEBUG] Preparing to push changes to GitHub...")
             g = Github(GITHUB_TOKEN)
             repo = g.get_repo(GITHUB_REPO)
             base = repo.get_branch(DEFAULT_BRANCH)
             branch_name = f"infra-change-{req.user_id}-{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}"
             repo.create_git_ref(ref=f"refs/heads/{branch_name}", sha=base.commit.sha)
             commit_message = f"Apply infrastructure change for user {req.user_id} via chatbot"
-            for path, content in changed_files.items():
+            for path, content in updated_files.items():
+                print(f"[DEBUG] Committing file: {path}")
                 # If file exists, update; else, create
                 try:
                     f = repo.get_contents(path, ref=branch_name)
@@ -198,14 +230,17 @@ def approve(req: ApprovalRequest):
                     repo.create_file(path, commit_message, content, branch=branch_name)
             pr = repo.create_pull(
                 title=f"Infra change for user {req.user_id}",
-                body="Automated PR from GCP Terraform Chatbot" + (f"\n\nSummary: {summary}" if summary else ""),
+                body="Automated PR from GCP Terraform Chatbot",
                 head=branch_name,
                 base=DEFAULT_BRANCH
             )
-            return {"result": f"Pull request created: {pr.html_url}", "summary": summary}
+            print(f"[DEBUG] Pull request created: {pr.html_url}")
+            return {"result": f"Pull request created: {pr.html_url}"}
         except Exception as e:
+            print(f"[ERROR] Error creating PR: {e}")
             return {"result": f"Error creating PR: {str(e)}"}
     else:
         user_terraform_change.pop(req.user_id, None)
         user_terraform_context.pop(req.user_id, None)
+        print("[DEBUG] Request rejected and change discarded.")
         return {"result": "Request rejected and change discarded."}
