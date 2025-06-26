@@ -2,29 +2,26 @@ import React, { useState } from 'react';
 import axios from 'axios';
 
 function parseBotResponse(response) {
-  // Extract summary
-  let summary = null;
-  let change = null;
+  // Extract all block changes
+  const blockPattern = /File:\s*(.*?)\s*Block:\s*(.*?)\s*```hcl\s*([\s\S]*?)```/g;
+  let match;
+  const blocks = [];
+  while ((match = blockPattern.exec(response)) !== null) {
+    blocks.push({
+      file: match[1].trim(),
+      block: match[2].trim(),
+      code: match[3].trim(),
+    });
+  }
 
-  // Match summary between 'Summary:' and 'Change:'
-  const summaryMatch = response.match(/Summary:(.*?)(Change:|$)/s);
+  // Optionally extract a summary
+  let summary = null;
+  const summaryMatch = response.match(/Summary:(.*?)(File:|$)/s);
   if (summaryMatch) {
     summary = summaryMatch[1].replace(/\n/g, ' ').trim();
   }
 
-  // Match diff code block after 'Change:'
-  const diffMatch = response.match(/Change:\s*```diff([\s\S]*?)```/);
-  if (diffMatch) {
-    change = diffMatch[1].trim();
-  } else {
-    // fallback: match any diff code block
-    const fallbackDiff = response.match(/```diff([\s\S]*?)```/);
-    if (fallbackDiff) {
-      change = fallbackDiff[1].trim();
-    }
-  }
-
-  return { summary, change };
+  return { summary, blocks };
 }
 
 function App() {
@@ -38,11 +35,11 @@ function App() {
     if (!input.trim()) return;
     setMessages([...messages, { sender: 'user', text: input }]);
     const res = await axios.post('/chat', { message: input, user_id });
-    const { summary, change } = parseBotResponse(res.data.response);
-    if (summary || change) {
+    const { summary, blocks } = parseBotResponse(res.data.response);
+    if (summary || (blocks && blocks.length > 0)) {
       setMessages(msgs => [
         ...msgs,
-        { sender: 'bot', summary, change, text: res.data.response, showApproval: true }
+        { sender: 'bot', summary, blocks, text: res.data.response, showApproval: true }
       ]);
       setAwaitingApproval(true);
     } else {
@@ -67,28 +64,17 @@ function App() {
         {messages.map((msg, i) => (
           <div key={i} style={{ textAlign: msg.sender === 'user' ? 'right' : 'left', marginBottom: 16 }}>
             <b>{msg.sender === 'user' ? 'You' : 'Bot'}:</b>
-            {msg.sender === 'bot' && (msg.summary || msg.change) ? (
+            {msg.sender === 'bot' && (msg.summary || (msg.blocks && msg.blocks.length > 0)) ? (
               <div>
                 {msg.summary && <div style={{ margin: '8px 0', color: '#333' }}><b>Summary:</b> {msg.summary}</div>}
-                {msg.change && (
-                  <div style={{ margin: '8px 0' }}>
-                    <b>Change:</b>
+                {msg.blocks && msg.blocks.map((block, idx) => (
+                  <div key={idx} style={{ margin: '8px 0' }}>
+                    <b>File:</b> {block.file} <b>Block:</b> {block.block}
                     <pre style={{ background: '#f4f4f4', padding: 10, borderRadius: 4, overflowX: 'auto' }}>
-                      {msg.change.split('\n').map((line, idx) => {
-                        let color = '#222';
-                        if (line.startsWith('+')) color = '#22863a'; // green
-                        else if (line.startsWith('-')) color = '#cb2431'; // red
-                        else if (line.startsWith('@@')) color = '#6f42c1'; // purple for hunk headers
-                        return (
-                          <span key={idx} style={{ color }}>
-                            {line}
-                            {'\n'}
-                          </span>
-                        );
-                      })}
+                      {block.code}
                     </pre>
                   </div>
-                )}
+                ))}
                 {msg.showApproval && i === messages.length - 1 && awaitingApproval && (
                   <div style={{ marginTop: 10 }}>
                     <button onClick={() => handleApproval('approve')} style={{ marginRight: 8, padding: '6px 16px', background: '#4caf50', color: 'white', border: 'none', borderRadius: 4 }}>Create New Branch</button>

@@ -10,6 +10,7 @@ import datetime
 import difflib
 from unidiff import PatchSet
 import io
+import re
 
 # Load environment variables from .env file
 load_dotenv()
@@ -64,11 +65,11 @@ def initial_summary_and_diff(user_prompt: str, files: list) -> str:
         f"You are an expert DevOps assistant. Here is the current state of the infrastructure as Terraform files:\n"
         f"{context}\n\n"
         f"User request: {user_prompt}\n\n"
-        f"Output ONLY a concise summary and a valid unified diff (as from `git diff`).\n"
-        f"Format your response as:\n"
-        f"Summary: <summary here>\n"
-        f"Change:\n```diff\n<diff or patch here>\n```\n\n"
-        f"Do not include explanations, comments, or extra text."
+        f"For each file that needs to be changed, output only the full, updated content for each changed block (resource/module/variable/etc.), with clear file and block identifiers.\n"
+        f"Use this format for each change:\n"
+        f"File: <filename>\nBlock: <block identifier or resource name>\n```hcl\n<full new block content>\n```\n"
+        f"Repeat for each changed block in each file.\n"
+        f"Do NOT include explanations, comments, or extra text."
     )
     return call_vertex_ai(full_prompt)
 
@@ -85,7 +86,7 @@ def validate_and_fix_diff(diff: str, files: list) -> str:
         f"Here is the current state of the infrastructure as Terraform files:\n"
         f"{context}\n\n"
         f"Here is a unified diff:\n````diff\n{diff}\n````\n"
-        f"Is this diff valid and patchable? If not, fix it and output only the corrected diff. Output only the valid unified diff, nothing else."
+        f"STRICT: Output ONLY a valid, patchable unified diff for all changed files. Do NOT include any 'File: ...' blocks, explanations, or extra text. Only the diff. Ensure there are blank lines between file diffs. Double-check that all hunk headers, line numbers, and context match the current file content exactly. If you are unsure, output a full file diff that replaces the entire file, with correct hunk headers and context."
     )
     return call_vertex_ai(prompt)
 
@@ -93,58 +94,163 @@ def apply_diff_to_files(files, diff_text):
     """
     Apply a unified diff to a list of files (dicts with 'path' and 'content').
     Returns a dict of updated file contents {path: new_content}.
+    Handles multi-file diffs robustly: tries PatchSet on the whole diff, falls back to per-file splitting if needed.
     """
-    print("[DEBUG] Raw diff_text received:")
+    print("[DEBUG] Raw validated diff_text to be applied:")
     print(diff_text)
+    # Remove markdown code block markers if present
+    diff_text = re.sub(r'^```diff\s*|```$', '', diff_text.strip(), flags=re.MULTILINE)
     # Remove '\ No newline at end of file' lines
-    diff_text = '\n'.join(line for line in diff_text.splitlines() if line.strip() != '\\ No newline at end of file')
+    diff_text = '\n'.join(line for line in diff_text.splitlines() if line.strip() != '\ No newline at end of file')
     file_map = {f['path']: f['content'].splitlines(keepends=True) for f in files}
     updated_files = {path: ''.join(lines) for path, lines in file_map.items()}
     print(f"[DEBUG] Files in repo context: {list(file_map.keys())}")
-    patch = PatchSet(io.StringIO(diff_text))
-    diff_files = [patched_file.path for patched_file in patch]
-    print(f"[DEBUG] Files found in diff: {diff_files}")
-    for patched_file in patch:
-        # Remove a/ or b/ prefix for matching
-        path = patched_file.path
-        if path.startswith('a/') or path.startswith('b/'):
-            path = path[2:]
-        if path not in file_map:
-            print(f"[DEBUG] Creating new file from diff: {path}")
-            # New file: build content from added and context lines in the diff
-            new_lines = []
+
+    try:
+        patch = PatchSet(io.StringIO(diff_text))
+        print(f"[DEBUG] PatchSet parsed {len(patch)} files from unified diff.")
+        for patched_file in patch:
+            # Remove a/ or b/ prefix for matching
+            path = patched_file.path
+            if path.startswith('a/') or path.startswith('b/'):
+                path = path[2:]
+            file_exists = path in file_map
+            print(f"[DEBUG] Processing file: {path} (exists in repo: {file_exists})")
+            if file_exists:
+                print(f"[DEBUG] File '{path}' length: {len(file_map[path])} lines.")
+            else:
+                print(f"[DEBUG] File '{path}' does not exist in repo context. Will be created if diff applies.")
             for hunk in patched_file:
-                for line in hunk:
-                    if line.is_added or line.is_context:
-                        new_lines.append(line.value)
-            updated_files[path] = ''.join(new_lines)
-            continue
-        print(f"[DEBUG] Updating existing file '{path}' with {len(file_map[path])} original lines.")
-        for hunk in patched_file:
-            print(f"[DEBUG] Hunk header: source_start={hunk.source_start}, source_length={hunk.source_length}, target_start={hunk.target_start}, target_length={hunk.target_length}")
-        original = file_map[path]
-        new_lines = []
-        i = 0
-        for hunk in patched_file:
-            # Add unchanged lines before the hunk
-            while i < hunk.source_start - 1:
-                new_lines.append(original[i])
-                i += 1
-            # Apply hunk
-            for line in hunk:
-                if line.is_added:
-                    new_lines.append(line.value)
-                elif line.is_context:
-                    new_lines.append(original[i])
-                    i += 1
-                elif line.is_removed:
-                    i += 1
-            # After hunk, i is at the next line to process
-        # Add any remaining lines after the last hunk
-        new_lines.extend(original[i:])
-        updated_files[path] = ''.join(new_lines)
-    print(f"[DEBUG] Updated files to be returned: {list(updated_files.keys())}")
-    return updated_files
+                print(f"[DEBUG] Hunk header for {path}: source_start={hunk.source_start}, source_length={hunk.source_length}, target_start={hunk.target_start}, target_length={hunk.target_length}")
+            if not file_exists:
+                print(f"[DEBUG] Creating new file from diff: {path}")
+                # New file: build content from added and context lines in the diff
+                new_lines = []
+                for hunk in patched_file:
+                    for line in hunk:
+                        if line.is_added or line.is_context:
+                            new_lines.append(line.value)
+                updated_files[path] = ''.join(new_lines)
+                print(f"[DEBUG] New file created: {path}")
+                continue
+            original = file_map[path]
+            new_lines = []
+            i = 0
+            try:
+                for hunk in patched_file:
+                    print(f"[DEBUG] Applying hunk to {path}: file length={len(original)}, hunk source_start={hunk.source_start}, hunk source_length={hunk.source_length}")
+                    # Add unchanged lines before the hunk
+                    while i < hunk.source_start - 1:
+                        new_lines.append(original[i])
+                        i += 1
+                    # Apply hunk
+                    for line in hunk:
+                        if line.is_added:
+                            new_lines.append(line.value)
+                        elif line.is_context:
+                            new_lines.append(original[i])
+                            i += 1
+                        elif line.is_removed:
+                            i += 1
+                    # After hunk, i is at the next line to process
+                # Add any remaining lines after the last hunk
+                new_lines.extend(original[i:])
+                updated_files[path] = ''.join(new_lines)
+                print(f"[DEBUG] Updated file: {path}")
+            except IndexError as e:
+                print(f"[ERROR] IndexError applying hunk in file {path}: {e}")
+                print(f"[ERROR] Falling back to full file replacement for {path} using all added/context lines from diff.")
+                fallback_lines = []
+                for hunk in patched_file:
+                    for line in hunk:
+                        # Only include actual code lines, not diff headers or file markers
+                        if (line.is_added or line.is_context) and not (
+                            line.value.strip().startswith('--- a/') or
+                            line.value.strip().startswith('+++ b/') or
+                            line.value.strip().startswith('@@') or
+                            line.value.strip().startswith('File:')
+                        ):
+                            fallback_lines.append(line.value)
+                updated_files[path] = ''.join(fallback_lines)
+                print(f"[DEBUG] Fallback content for {path} (first 500 chars):\n{updated_files[path][:500]}")
+        print(f"[DEBUG] Updated files to be returned: {list(updated_files.keys())}")
+        return updated_files
+    except Exception as e:
+        print(f"[ERROR] PatchSet failed on whole diff: {e}")
+        print("[DEBUG] Falling back to per-file diff splitting.")
+        # Fallback: Pre-process and split diff into per-file chunks
+        file_diffs = re.split(r'(?=^--- a/)', diff_text, flags=re.MULTILINE)
+        for file_diff in file_diffs:
+            file_diff = file_diff.strip()
+            if not file_diff:
+                continue
+            print(f"[DEBUG] Processing file diff chunk:\n{file_diff[:500]}\n--- END CHUNK ---")
+            try:
+                patch = PatchSet(io.StringIO(file_diff))
+            except Exception as e:
+                print(f"[ERROR] PatchSet parse error for chunk: {e}")
+                continue
+            for patched_file in patch:
+                # Remove a/ or b/ prefix for matching
+                path = patched_file.path
+                if path.startswith('a/') or path.startswith('b/'):
+                    path = path[2:]
+                file_exists = path in file_map
+                print(f"[DEBUG] (Fallback) Processing file: {path} (exists in repo: {file_exists})")
+                if file_exists:
+                    print(f"[DEBUG] (Fallback) File '{path}' length: {len(file_map[path])} lines.")
+                else:
+                    print(f"[DEBUG] (Fallback) File '{path}' does not exist in repo context. Will be created if diff applies.")
+                for hunk in patched_file:
+                    print(f"[DEBUG] (Fallback) Hunk header for {path}: source_start={hunk.source_start}, source_length={hunk.source_length}, target_start={hunk.target_start}, target_length={hunk.target_length}")
+                if not file_exists:
+                    print(f"[DEBUG] (Fallback) Creating new file from diff: {path}")
+                    new_lines = []
+                    for hunk in patched_file:
+                        for line in hunk:
+                            if line.is_added or line.is_context:
+                                new_lines.append(line.value)
+                    updated_files[path] = ''.join(new_lines)
+                    print(f"[DEBUG] (Fallback) New file created: {path}")
+                    continue
+                original = file_map[path]
+                new_lines = []
+                i = 0
+                try:
+                    for hunk in patched_file:
+                        print(f"[DEBUG] (Fallback) Applying hunk to {path}: file length={len(original)}, hunk source_start={hunk.source_start}, hunk source_length={hunk.source_length}")
+                        while i < hunk.source_start - 1:
+                            new_lines.append(original[i])
+                            i += 1
+                        for line in hunk:
+                            if line.is_added:
+                                new_lines.append(line.value)
+                            elif line.is_context:
+                                new_lines.append(original[i])
+                                i += 1
+                            elif line.is_removed:
+                                i += 1
+                    new_lines.extend(original[i:])
+                    updated_files[path] = ''.join(new_lines)
+                    print(f"[DEBUG] (Fallback) Updated file: {path}")
+                except IndexError as e:
+                    print(f"[ERROR] (Fallback) IndexError applying hunk in file {path}: {e}")
+                    print(f"[ERROR] (Fallback) Falling back to full file replacement for {path} using all added/context lines from diff.")
+                    fallback_lines = []
+                    for hunk in patched_file:
+                        for line in hunk:
+                            # Only include actual code lines, not diff headers or file markers
+                            if (line.is_added or line.is_context) and not (
+                                line.value.strip().startswith('--- a/') or
+                                line.value.strip().startswith('+++ b/') or
+                                line.value.strip().startswith('@@') or
+                                line.value.strip().startswith('File:')
+                            ):
+                                fallback_lines.append(line.value)
+                    updated_files[path] = ''.join(fallback_lines)
+                    print(f"[DEBUG] (Fallback) Fallback content for {path} (first 500 chars):\n{updated_files[path][:500]}")
+        print(f"[DEBUG] (Fallback) Updated files to be returned: {list(updated_files.keys())}")
+        return updated_files
 
 def parse_changed_files_and_summary(response: str):
     """
@@ -152,7 +258,6 @@ def parse_changed_files_and_summary(response: str):
     Expects format:
     Summary: ...\nFile: <filename>\n```terraform\n<new file content>\n```\n(Repeat for each changed file)
     """
-    import re
     summary_match = re.search(r'^Summary:(.*)$', response, re.MULTILINE)
     summary = summary_match.group(1).strip() if summary_match else None
     files = {}
@@ -161,6 +266,91 @@ def parse_changed_files_and_summary(response: str):
     for filename, content in file_blocks:
         files[filename.strip()] = content.strip()
     return summary, files
+
+# Helper: parse model response for block changes
+def parse_block_changes(response: str):
+    """
+    Parse model response for block changes in the format:
+    File: <filename>\nBlock: <block identifier>\n```hcl\n<block content>\n```\n
+    Returns: dict {filename: list of (block_id, block_content)}
+    """
+    changes = {}
+    pattern = r'File: (.*?)\nBlock: (.*?)\n```hcl\n([\s\S]*?)```'
+    for match in re.finditer(pattern, response):
+        filename = match.group(1).strip()
+        block_id = match.group(2).strip()
+        block_content = match.group(3).strip()
+        if filename not in changes:
+            changes[filename] = []
+        changes[filename].append((block_id, block_content))
+    return changes
+
+# Helper: replace or insert block in file content
+def replace_or_insert_block(file_content, block_id, new_block):
+    import re
+    print(f"[DEBUG] Attempting to match block_id: {block_id}")
+    print(f"[DEBUG] File content preview:\n{file_content[:200]}")
+    m = re.match(r'^(resource|module|variable)\s+"([^"]+)"\s+"([^"]+)"', block_id)
+    if m:
+        block_type, type_name, name = m.groups()
+    else:
+        m2 = re.match(r'^([a-zA-Z0-9_]+)\.([a-zA-Z0-9_]+)$', block_id)
+        if m2:
+            block_type = "resource"
+            type_name, name = m2.groups()
+        else:
+            print(f"[DEBUG] Could not parse block_id, using fallback.")
+            block_pattern = re.compile(
+                r'(resource|module|variable)\s+"[^\"]+"\s+"' + re.escape(block_id) + r'"\s*\{[\s\S]*?^[ \t]*\}',
+                re.MULTILINE
+            )
+            matches = list(block_pattern.finditer(file_content))
+            print(f"[DEBUG] Found {len(matches)} matches for block_id '{block_id}' (fallback)")
+            if matches:
+                start, end = matches[0].span()
+                new_content = file_content[:start] + new_block + '\n' + file_content[end:]
+                print(f"[DEBUG] Replaced block '{block_id}' in file (fallback).")
+                return new_content
+            else:
+                print(f"[DEBUG] Block '{block_id}' not found, inserting at end of file (fallback).")
+                return file_content.rstrip() + '\n\n' + new_block + '\n'
+    block_header = f'{block_type} "{type_name}" "{name}"'
+    print(f"[DEBUG] Looking for block header: {block_header}")
+    block_regex = (
+        rf'{block_type}\s+"{re.escape(type_name)}"\s+"{re.escape(name)}"\s*\{{[\s\S]*?^[ \t]*\}}'
+    )
+    print(f"[DEBUG] Using regex: {block_regex}")
+    block_pattern = re.compile(block_regex, re.MULTILINE)
+    matches = list(block_pattern.finditer(file_content))
+    print(f"[DEBUG] Found {len(matches)} matches for block_id '{block_id}'")
+    if matches:
+        start, end = matches[0].span()
+        new_content = file_content[:start] + new_block + '\n' + file_content[end:]
+        print(f"[DEBUG] Replaced block '{block_id}' in file.")
+        return new_content
+    else:
+        print(f"[DEBUG] Block '{block_id}' not found, inserting at end of file.")
+        return file_content.rstrip() + '\n\n' + new_block + '\n'
+
+# Main patch-by-block logic
+def apply_block_changes(files, block_changes):
+    """
+    files: list of dicts with 'path' and 'content'
+    block_changes: dict {filename: list of (block_id, block_content)}
+    Returns: dict {filename: new_content}
+    """
+    updated_files = {f['path']: f['content'] for f in files}
+    for filename, changes in block_changes.items():
+        if filename not in updated_files:
+            print(f"[DEBUG] File '{filename}' not found in repo context, skipping.")
+            continue
+        content = updated_files[filename]
+        for block_id, new_block in changes:
+            print(f"[DEBUG] Applying block change: file={filename}, block_id={block_id}")
+            content = replace_or_insert_block(content, block_id, new_block)
+        updated_files[filename] = content
+    print(f"[DEBUG] Updated files after block changes: {list(updated_files.keys())}")
+    return updated_files
 
 @app.get("/health")
 def health():
@@ -172,46 +362,48 @@ def chat(req: ChatRequest):
         files = fetch_terraform_files()
         print(f"[DEBUG] Files fetched for context: {[f['path'] for f in files]}")
         response = initial_summary_and_diff(req.message, files)
-        print(f"[DEBUG] Initial model response (summary+diff):\n{response}")
-        # Extract summary and diff
-        import re
-        summary_match = re.search(r"Summary:(.*?)(Change:|$)", response, re.DOTALL)
-        summary = summary_match.group(1).strip() if summary_match else None
-        diff_match = re.search(r"Change:\s*```diff([\s\S]*?)```", response)
-        diff = diff_match.group(1).strip() if diff_match else None
-        print(f"[DEBUG] Extracted summary: {summary}")
-        print(f"[DEBUG] Extracted diff:\n{diff}")
-        user_terraform_change[req.user_id] = diff
+        print(f"[DEBUG] Initial model response (block changes):\n{response}")
+        # Store the full response for approval
+        user_terraform_change[req.user_id] = response
         user_terraform_context[req.user_id] = files
-        user_terraform_summary = summary
-        return {"response": response, "summary": summary, "diff": diff}
+        return {"response": response}
     except Exception as e:
         print(f"[ERROR] Exception in /chat: {e}")
         return {"response": f"Error: {str(e)}"}
 
 @app.post("/approve")
 def approve(req: ApprovalRequest):
+    print(f"[DEBUG] user_terraform_change keys: {list(user_terraform_change.keys())}")
+    print(f"[DEBUG] user_terraform_context keys: {list(user_terraform_context.keys())}")
+    print(f"[DEBUG] user_terraform_change for user {req.user_id}: {user_terraform_change.get(req.user_id)}")
+    print(f"[DEBUG] user_terraform_context for user {req.user_id}: {user_terraform_context.get(req.user_id)}")
     if req.action == "approve":
-        diff = user_terraform_change.get(req.user_id)
+        response = user_terraform_change.get(req.user_id)
         files = user_terraform_context.get(req.user_id)
-        if not diff or not files:
+        if not response or not files:
             print("[DEBUG] No change or context found for this user.")
             return {"result": "No change or context found for this user. Please generate a change first."}
-        print(f"[DEBUG] Initial diff for user {req.user_id}:\n{diff}")
-        # Step 2: Clean up diff
-        cleaned_diff = cleanup_diff(diff)
-        print(f"[DEBUG] Cleaned diff (after cleanup prompt):\n{cleaned_diff}")
-        # Step 3: Validate/fix diff
-        validated_diff = validate_and_fix_diff(cleaned_diff, files)
-        print(f"[DEBUG] Validated/fixed diff (after validation prompt):\n{validated_diff}")
-        # Step 4: Apply diff and push
+        print(f"[DEBUG] Model response for user {req.user_id} (block changes):\n{response}")
         try:
-            print(f"[DEBUG] Applying validated diff to files...")
-            updated_files = apply_diff_to_files(files, validated_diff)
-            print(f"[DEBUG] Files after applying diff: {list(updated_files.keys())}")
+            block_changes = parse_block_changes(response)
+            if not block_changes:
+                print("[DEBUG] No block changes parsed from model response.")
+                return {"result": "No block changes found in model response."}
+            updated_files = apply_block_changes(files, block_changes)
         except Exception as e:
-            print(f"[ERROR] Error applying diff: {e}")
-            return {"result": f"Error applying diff: {e}"}
+            print(f"[ERROR] Error applying block changes: {e}")
+            return {"result": f"Error applying block changes: {e}"}
+        # Only push if any file content actually changed
+        changed = False
+        for f in files:
+            orig = f['content']
+            updated = updated_files.get(f['path'], orig)
+            if orig != updated:
+                changed = True
+                break
+        if not changed:
+            print("[DEBUG] No actual file changes detected. Not creating PR.")
+            return {"result": "No files were changed. The block changes could not be applied or resulted in no changes."}
         try:
             print(f"[DEBUG] Preparing to push changes to GitHub...")
             g = Github(GITHUB_TOKEN)
