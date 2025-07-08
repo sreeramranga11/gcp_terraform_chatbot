@@ -64,6 +64,7 @@ def initial_summary_and_diff(user_prompt: str, files: list) -> str:
     full_prompt = (
         f"You are an expert DevOps assistant. Here is the current state of the infrastructure as Terraform files:\n"
         f"{context}\n\n"
+        f"IMPORTANT: First determine if this is actually a request for infrastructure changes or just casual conversation. If it is casual conversation, respond with a friendly message\n"
         f"User request: {user_prompt}\n\n"
         f"For each file that needs to be changed, output only the full, updated content for each changed block (resource/module/variable/etc.), with clear file and block identifiers.\n"
         f"Use this format for each change:\n"
@@ -312,39 +313,50 @@ def replace_or_insert_block(file_content, block_id, new_block):
     import re
     print(f"[DEBUG] Attempting to match block_id: {block_id}")
     print(f"[DEBUG] File content preview:\n{file_content[:200]}")
-    m = re.match(r'^(resource|module|variable)\s+"([^"]+)"\s+"([^"]+)"', block_id)
-    if m:
-        block_type, type_name, name = m.groups()
-    else:
-        m2 = re.match(r'^([a-zA-Z0-9_]+)\.([a-zA-Z0-9_]+)$', block_id)
-        if m2:
-            block_type = "resource"
-            type_name, name = m2.groups()
-        else:
-            print(f"[DEBUG] Could not parse block_id, using fallback.")
-            # fallback: try to find any block with block_id as name (regex, bracket counting)
-            block_header_pattern = re.compile(r'(resource|module|variable)\s+"[^"]+"\s+"' + re.escape(block_id) + r'"')
-            match = block_header_pattern.search(file_content)
-            if match:
-                block_header = match.group(0)
-                span = find_block_span(file_content, block_header)
-                if span:
-                    start, end = span
+    # 1. Try to match assignment: block_id = [ or block_id = {
+    assign_pattern = re.compile(rf'^{re.escape(block_id)}\s*=\s*([\[\{{])', re.MULTILINE)
+    assign_match = assign_pattern.search(file_content)
+    if assign_match:
+        open_bracket = assign_match.group(1)
+        close_bracket = ']' if open_bracket == '[' else '}'
+        start = assign_match.start()
+        i = assign_match.end()
+        depth = 1
+        while i < len(file_content):
+            if file_content[i] == open_bracket:
+                depth += 1
+            elif file_content[i] == close_bracket:
+                depth -= 1
+                if depth == 0:
+                    end = i + 1
                     new_content = file_content[:start] + new_block + '\n' + file_content[end:]
-                    print(f"[DEBUG] Replaced block '{block_id}' in file (fallback, bracket-counting).")
+                    print(f"[DEBUG] Replaced assignment '{block_id}' in file (bracket-counting for assignment).")
                     return new_content
-            print(f"[DEBUG] Block '{block_id}' not found, inserting at end of file (fallback).")
-            return file_content.rstrip() + '\n\n' + new_block + '\n'
-    block_header = f'{block_type} "{type_name}" "{name}"'
-    print(f"[DEBUG] Looking for block header: {block_header}")
-    span = find_block_span(file_content, block_header)
-    if span:
-        start, end = span
-        new_content = file_content[:start] + new_block + '\n' + file_content[end:]
-        print(f"[DEBUG] Replaced block '{block_id}' in file (bracket-counting).")
-        return new_content
+            i += 1
+        print(f"[DEBUG] Assignment header found but not closed properly for '{block_id}'. Appending at end.")
+        return file_content.rstrip() + '\n\n' + new_block + '\n'
+    # 2. Try to match block header: block_id { (as before)
+    block_header_pattern = re.compile(rf'^{re.escape(block_id)}\s*\{{', re.MULTILINE)
+    match = block_header_pattern.search(file_content)
+    if match:
+        start = match.start()
+        i = match.end()
+        depth = 1
+        while i < len(file_content):
+            if file_content[i] == '{':
+                depth += 1
+            elif file_content[i] == '}':
+                depth -= 1
+                if depth == 0:
+                    end = i + 1
+                    new_content = file_content[:start] + new_block + '\n' + file_content[end:]
+                    print(f"[DEBUG] Replaced block '{block_id}' in file (bracket-counting, robust header match).")
+                    return new_content
+            i += 1
+        print(f"[DEBUG] Block header found but block not closed properly for '{block_id}'. Appending at end.")
+        return file_content.rstrip() + '\n\n' + new_block + '\n'
     else:
-        print(f"[DEBUG] Block '{block_id}' not found, inserting at end of file.")
+        print(f"[DEBUG] Block or assignment header for '{block_id}' not found, inserting at end of file.")
         return file_content.rstrip() + '\n\n' + new_block + '\n'
 
 # Main patch-by-block logic

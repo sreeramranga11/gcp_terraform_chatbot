@@ -93,7 +93,7 @@ function App() {
         onChange={e => setInput(e.target.value)}
         onKeyDown={e => e.key === 'Enter' && sendMessage()}
         style={{ width: '80%', padding: 8 }}
-        placeholder="Type your command..."
+        placeholder="Say hello or ask for infrastructure changes..."
       />
       <button onClick={sendMessage} style={{ padding: 8, marginLeft: 8 }}>Send</button>
     </div>
