@@ -418,7 +418,25 @@ def jira_comment_issue(issue_key, comment):
     url = f"{JIRA_URL}/rest/api/3/issue/{issue_key}/comment"
     auth = (JIRA_USER, JIRA_API_TOKEN)
     headers = {"Accept": "application/json", "Content-Type": "application/json"}
-    resp = requests.post(url, auth=auth, headers=headers, json={"body": comment})
+    # Jira Cloud requires Atlassian Document Format (ADF)
+    body = {
+        "body": {
+            "type": "doc",
+            "version": 1,
+            "content": [
+                {
+                    "type": "paragraph",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": comment
+                        }
+                    ]
+                }
+            ]
+        }
+    }
+    resp = requests.post(url, auth=auth, headers=headers, json=body)
     print(f"[JIRA] Comment response: {resp.status_code} {resp.text}")
     return resp.status_code == 201
 
@@ -616,7 +634,13 @@ async def jira_webhook(request: Request):
             print(f"[JIRA WEBHOOK] Error getting summary: {e}")
             summary_text = "(Could not generate summary)"
         jira_transition_issue(key, "In Review")
-        comment = f"Proposed infrastructure changes are ready for review.\n\nSummary: {summary_text}\n\nPR: {pr.html_url}"
+        comment = (
+            f"Automated infrastructure change proposed for this ticket.\n\n"
+            f"**Jira Ticket:** {key} - {summary}\n\n"
+            f"**Summary of changes:**\n{summary_text}\n\n"
+            f"**Review the proposed changes in this PR:** {pr.html_url}\n\n"
+            f"If you have feedback or require changes, please comment here."
+        )
         jira_comment_issue(key, comment)
 
         return {
