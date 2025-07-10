@@ -13,9 +13,18 @@ import io
 import re
 import json
 import requests
+from google.cloud import logging as gcp_logging
 
 # Load environment variables from .env file
 load_dotenv()
+
+# Initialize GCP Logging
+try:
+    gcp_logging_client = gcp_logging.Client()
+    gcp_logging_client.setup_logging()
+    print("[GCP LOGGING] Initialized GCP logging client.")
+except Exception as e:
+    print(f"[GCP LOGGING] Failed to initialize: {e}")
 
 app = FastAPI()
 
@@ -542,15 +551,20 @@ def summarize(req: SummarizeRequest):
 @app.post("/webhook/jira")
 async def jira_webhook(request: Request):
     print("[JIRA WEBHOOK] Endpoint hit!")
+    import logging
+    logger = logging.getLogger("jira-webhook")
     payload = await request.json()
+    logger.info({"event": "webhook_received", "payload": payload})
     print("[JIRA WEBHOOK] Received payload:", json.dumps(payload, indent=2))
 
     # 1. Parse event type
     event_type = request.headers.get("X-Atlassian-Webhook-Identifier") or payload.get("webhookEvent")
+    logger.info({"event": "event_type_parsed", "event_type": event_type})
     print(f"[JIRA WEBHOOK] Event type: {event_type}")
 
     # 2. Only process issue_created events
     if payload.get("webhookEvent") != "jira:issue_created":
+        logger.info({"event": "ignored_event", "reason": "not issue_created", "event_type": payload.get("webhookEvent")})
         print("[JIRA WEBHOOK] Ignoring non-issue_created event.")
         return {"status": "ignored", "reason": "not issue_created"}
 
@@ -561,19 +575,20 @@ async def jira_webhook(request: Request):
     summary = fields.get("summary")
     description = fields.get("description")
     reporter = fields.get("reporter", {}).get("displayName")
+    status_name = fields.get("status", {}).get("name", "")
+    logger.info({"event": "ticket_info_extracted", "key": key, "summary": summary, "status": status_name, "reporter": reporter})
     print(f"[JIRA WEBHOOK] Issue key: {key}")
     print(f"[JIRA WEBHOOK] Summary: {summary}")
     print(f"[JIRA WEBHOOK] Description: {description}")
     print(f"[JIRA WEBHOOK] Reporter: {reporter}")
-
-    # Only process if status is 'To Do'
-    status_name = fields.get("status", {}).get("name", "")
     print(f"[JIRA WEBHOOK] Issue status (raw): '{status_name}'")
-    if status_name.strip().lower() != "To Do":
+    if status_name.strip().lower() != "to do":
+        logger.info({"event": "ignored_status", "key": key, "status": status_name})
         print("[JIRA WEBHOOK] Ticket is not in 'To Do' status. Skipping agentic workflow.")
         return {"status": "ignored", "reason": "not in To Do"}
 
     try:
+        logger.info({"event": "workflow_triggered", "key": key})
         # Move ticket to In Progress
         jira_transition_issue(key, "In Progress")
 
@@ -582,8 +597,10 @@ async def jira_webhook(request: Request):
             user_prompt += f"\n{description}"
         print(f"[JIRA WEBHOOK] Using user_prompt: {user_prompt}")
         files = fetch_terraform_files()
+        logger.info({"event": "files_fetched", "key": key, "files": [f['path'] for f in files]})
         print(f"[JIRA WEBHOOK] Files fetched for context: {[f['path'] for f in files]}")
         response = initial_summary_and_diff(user_prompt, files)
+        logger.info({"event": "model_response", "key": key, "response": response})
         print(f"[JIRA WEBHOOK] Model response (block changes):\n{response}")
         user_terraform_change[key] = response
         user_terraform_context[key] = files
@@ -591,6 +608,7 @@ async def jira_webhook(request: Request):
         # --- Apply changes and create PR (same as /approve logic) ---
         block_changes = parse_block_changes(response)
         if not block_changes:
+            logger.info({"event": "no_block_changes", "key": key})
             print("[JIRA WEBHOOK] No block changes parsed from model response.")
             return {"status": "no_changes", "reason": "No block changes found in model response."}
         updated_files = apply_block_changes(files, block_changes)
@@ -602,6 +620,7 @@ async def jira_webhook(request: Request):
                 changed = True
                 break
         if not changed:
+            logger.info({"event": "no_actual_changes", "key": key})
             print("[JIRA WEBHOOK] No actual file changes detected. Not creating PR.")
             return {"status": "no_changes", "reason": "No files were changed. The block changes could not be applied or resulted in no changes."}
         print(f"[JIRA WEBHOOK] Preparing to push changes to GitHub...")
@@ -624,6 +643,7 @@ async def jira_webhook(request: Request):
             head=branch_name,
             base=DEFAULT_BRANCH
         )
+        logger.info({"event": "pr_created", "key": key, "pr_url": pr.html_url, "branch": branch_name})
         print(f"[JIRA WEBHOOK] Pull request created: {pr.html_url}")
 
         # Move ticket to In Review and comment with summary and PR link
@@ -636,8 +656,10 @@ async def jira_webhook(request: Request):
                 f"{response}"
             )
             summary_text = call_vertex_ai(prompt)
+            logger.info({"event": "summary_generated", "key": key, "summary": summary_text})
             print(f"[JIRA WEBHOOK] Summary for comment: {summary_text}")
         except Exception as e:
+            logger.error({"event": "summary_error", "key": key, "error": str(e)})
             print(f"[JIRA WEBHOOK] Error getting summary: {e}")
             summary_text = "(Could not generate summary)"
         jira_transition_issue(key, "In Review")
@@ -649,6 +671,7 @@ async def jira_webhook(request: Request):
             f"If you have feedback or require changes, please comment here."
         )
         jira_comment_issue(key, comment)
+        logger.info({"event": "in_review_transitioned_and_commented", "key": key})
 
         return {
             "status": "pr_created",
@@ -659,5 +682,6 @@ async def jira_webhook(request: Request):
             "reporter": reporter
         }
     except Exception as e:
+        logger.error({"event": "error", "key": key, "error": str(e)})
         print(f"[JIRA WEBHOOK] Error in agentic workflow: {e}")
         return {"status": "error", "error": str(e)}
