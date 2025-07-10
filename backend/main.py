@@ -11,6 +11,8 @@ import difflib
 from unidiff import PatchSet
 import io
 import re
+import json
+import requests
 
 # Load environment variables from .env file
 load_dotenv()
@@ -22,6 +24,9 @@ REGION = os.getenv("REGION")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 GITHUB_REPO = os.getenv("GITHUB_REPO")
 DEFAULT_BRANCH = os.getenv("DEFAULT_BRANCH", "main")
+JIRA_URL = os.getenv("JIRA_URL")  # e.g., https://yourdomain.atlassian.net
+JIRA_USER = os.getenv("JIRA_USER")  # email or username
+JIRA_API_TOKEN = os.getenv("JIRA_API_TOKEN")
 
 # In-memory store for generated Terraform change and context per user
 user_terraform_change = {}
@@ -382,6 +387,41 @@ def apply_block_changes(files, block_changes):
     print(f"[DEBUG] Updated files after block changes: {list(updated_files.keys())}")
     return updated_files
 
+# Helper to transition a Jira issue
+def jira_transition_issue(issue_key, transition_name):
+    print(f"[JIRA] Transitioning {issue_key} to '{transition_name}'...")
+    # Get all transitions
+    url = f"{JIRA_URL}/rest/api/3/issue/{issue_key}/transitions"
+    auth = (JIRA_USER, JIRA_API_TOKEN)
+    headers = {"Accept": "application/json", "Content-Type": "application/json"}
+    resp = requests.get(url, auth=auth, headers=headers)
+    if resp.status_code != 200:
+        print(f"[JIRA] Failed to get transitions: {resp.text}")
+        return False
+    transitions = resp.json().get("transitions", [])
+    tid = None
+    for t in transitions:
+        if t["name"].lower() == transition_name.lower():
+            tid = t["id"]
+            break
+    if not tid:
+        print(f"[JIRA] Transition '{transition_name}' not found for {issue_key}.")
+        return False
+    # Do the transition
+    resp = requests.post(url, auth=auth, headers=headers, json={"transition": {"id": tid}})
+    print(f"[JIRA] Transition response: {resp.status_code} {resp.text}")
+    return resp.status_code == 204
+
+# Helper to comment on a Jira issue
+def jira_comment_issue(issue_key, comment):
+    print(f"[JIRA] Commenting on {issue_key}...")
+    url = f"{JIRA_URL}/rest/api/3/issue/{issue_key}/comment"
+    auth = (JIRA_USER, JIRA_API_TOKEN)
+    headers = {"Accept": "application/json", "Content-Type": "application/json"}
+    resp = requests.post(url, auth=auth, headers=headers, json={"body": comment})
+    print(f"[JIRA] Comment response: {resp.status_code} {resp.text}")
+    return resp.status_code == 201
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
@@ -480,3 +520,113 @@ def summarize(req: SummarizeRequest):
     )
     summary = call_vertex_ai(prompt)
     return {"summary": summary.strip()}
+
+@app.post("/webhook/jira")
+async def jira_webhook(request: Request):
+    print("[JIRA WEBHOOK] Endpoint hit!")
+    payload = await request.json()
+    print("[JIRA WEBHOOK] Received payload:", json.dumps(payload, indent=2))
+
+    # 1. Parse event type
+    event_type = request.headers.get("X-Atlassian-Webhook-Identifier") or payload.get("webhookEvent")
+    print(f"[JIRA WEBHOOK] Event type: {event_type}")
+
+    # 2. Only process issue_created events
+    if payload.get("webhookEvent") != "jira:issue_created":
+        print("[JIRA WEBHOOK] Ignoring non-issue_created event.")
+        return {"status": "ignored", "reason": "not issue_created"}
+
+    # 3. Extract ticket info
+    issue = payload.get("issue", {})
+    key = issue.get("key")
+    fields = issue.get("fields", {})
+    summary = fields.get("summary")
+    description = fields.get("description")
+    reporter = fields.get("reporter", {}).get("displayName")
+    print(f"[JIRA WEBHOOK] Issue key: {key}")
+    print(f"[JIRA WEBHOOK] Summary: {summary}")
+    print(f"[JIRA WEBHOOK] Description: {description}")
+    print(f"[JIRA WEBHOOK] Reporter: {reporter}")
+
+    try:
+        # Move ticket to In Progress
+        jira_transition_issue(key, "In Progress")
+
+        user_prompt = summary or ""
+        if description:
+            user_prompt += f"\n{description}"
+        print(f"[JIRA WEBHOOK] Using user_prompt: {user_prompt}")
+        files = fetch_terraform_files()
+        print(f"[JIRA WEBHOOK] Files fetched for context: {[f['path'] for f in files]}")
+        response = initial_summary_and_diff(user_prompt, files)
+        print(f"[JIRA WEBHOOK] Model response (block changes):\n{response}")
+        user_terraform_change[key] = response
+        user_terraform_context[key] = files
+
+        # --- Apply changes and create PR (same as /approve logic) ---
+        block_changes = parse_block_changes(response)
+        if not block_changes:
+            print("[JIRA WEBHOOK] No block changes parsed from model response.")
+            return {"status": "no_changes", "reason": "No block changes found in model response."}
+        updated_files = apply_block_changes(files, block_changes)
+        changed = False
+        for f in files:
+            orig = f['content']
+            updated = updated_files.get(f['path'], orig)
+            if orig != updated:
+                changed = True
+                break
+        if not changed:
+            print("[JIRA WEBHOOK] No actual file changes detected. Not creating PR.")
+            return {"status": "no_changes", "reason": "No files were changed. The block changes could not be applied or resulted in no changes."}
+        print(f"[JIRA WEBHOOK] Preparing to push changes to GitHub...")
+        g = Github(GITHUB_TOKEN)
+        repo = g.get_repo(GITHUB_REPO)
+        base = repo.get_branch(DEFAULT_BRANCH)
+        branch_name = f"infra-change-{key}-{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}"
+        repo.create_git_ref(ref=f"refs/heads/{branch_name}", sha=base.commit.sha)
+        commit_message = f"Apply infrastructure change for Jira ticket {key} via chatbot"
+        for path, content in updated_files.items():
+            print(f"[JIRA WEBHOOK] Committing file: {path}")
+            try:
+                f = repo.get_contents(path, ref=branch_name)
+                repo.update_file(path, commit_message, content, f.sha, branch=branch_name)
+            except Exception:
+                repo.create_file(path, commit_message, content, branch=branch_name)
+        pr = repo.create_pull(
+            title=f"Infra change for Jira ticket {key}",
+            body=f"Automated PR from GCP Terraform Chatbot for Jira ticket {key}",
+            head=branch_name,
+            base=DEFAULT_BRANCH
+        )
+        print(f"[JIRA WEBHOOK] Pull request created: {pr.html_url}")
+
+        # Move ticket to In Review and comment with summary and PR link
+        summary_text = None
+        try:
+            prompt = (
+                f"You are an expert DevOps assistant. Here is a set of Terraform block changes, each with a file and block name. "
+                f"Summarize the overall infrastructure change in 1-2 sentences, focusing on what is being added, removed, or modified. "
+                f"Do NOT include code, only a human-readable summary.\n\n"
+                f"{response}"
+            )
+            summary_text = call_vertex_ai(prompt)
+            print(f"[JIRA WEBHOOK] Summary for comment: {summary_text}")
+        except Exception as e:
+            print(f"[JIRA WEBHOOK] Error getting summary: {e}")
+            summary_text = "(Could not generate summary)"
+        jira_transition_issue(key, "In Review")
+        comment = f"Proposed infrastructure changes are ready for review.\n\nSummary: {summary_text}\n\nPR: {pr.html_url}"
+        jira_comment_issue(key, comment)
+
+        return {
+            "status": "pr_created",
+            "pr_url": pr.html_url,
+            "issue_key": key,
+            "summary": summary,
+            "description": description,
+            "reporter": reporter
+        }
+    except Exception as e:
+        print(f"[JIRA WEBHOOK] Error in agentic workflow: {e}")
+        return {"status": "error", "error": str(e)}
