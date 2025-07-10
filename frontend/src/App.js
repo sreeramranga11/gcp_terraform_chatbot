@@ -36,10 +36,20 @@ function App() {
     setMessages([...messages, { sender: 'user', text: input }]);
     const res = await axios.post('/chat', { message: input, user_id });
     const { summary, blocks } = parseBotResponse(res.data.response);
-    if (summary || (blocks && blocks.length > 0)) {
+    let summaryText = summary;
+    if ((blocks && blocks.length > 0)) {
+      // Always get a fresh summary from backend
+      try {
+        const sumRes = await axios.post('/summarize', { user_id });
+        summaryText = sumRes.data.summary;
+      } catch (e) {
+        summaryText = summary || '';
+      }
+    }
+    if (summaryText || (blocks && blocks.length > 0)) {
       setMessages(msgs => [
         ...msgs,
-        { sender: 'bot', summary, blocks, text: res.data.response, showApproval: true }
+        { sender: 'bot', summary: summaryText, blocks, text: res.data.response, showApproval: true }
       ]);
       setAwaitingApproval(true);
     } else {
@@ -93,7 +103,7 @@ function App() {
         onChange={e => setInput(e.target.value)}
         onKeyDown={e => e.key === 'Enter' && sendMessage()}
         style={{ width: '80%', padding: 8 }}
-        placeholder="Say hello or ask for infrastructure changes..."
+        placeholder="Type your command..."
       />
       <button onClick={sendMessage} style={{ padding: 8, marginLeft: 8 }}>Send</button>
     </div>

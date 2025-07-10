@@ -35,6 +35,9 @@ class ApprovalRequest(BaseModel):
     user_id: str
     action: str  # 'approve' or 'reject'
 
+class SummarizeRequest(BaseModel):
+    user_id: str
+
 
 def fetch_terraform_files():
     g = Github(GITHUB_TOKEN)
@@ -463,3 +466,17 @@ def approve(req: ApprovalRequest):
         user_terraform_context.pop(req.user_id, None)
         print("[DEBUG] Request rejected and change discarded.")
         return {"result": "Request rejected and change discarded."}
+
+@app.post("/summarize")
+def summarize(req: SummarizeRequest):
+    response = user_terraform_change.get(req.user_id)
+    if not response:
+        return {"summary": "No change found for this user."}
+    prompt = (
+        f"You are an expert DevOps assistant. Here is a set of Terraform block changes, each with a file and block name. "
+        f"Summarize the overall infrastructure change in 1-2 sentences, focusing on what is being added, removed, or modified. "
+        f"Do NOT include code, only a human-readable summary.\n\n"
+        f"{response}"
+    )
+    summary = call_vertex_ai(prompt)
+    return {"summary": summary.strip()}
