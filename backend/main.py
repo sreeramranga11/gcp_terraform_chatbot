@@ -566,6 +566,13 @@ async def jira_webhook(request: Request):
     print(f"[JIRA WEBHOOK] Description: {description}")
     print(f"[JIRA WEBHOOK] Reporter: {reporter}")
 
+    # Only process if status is 'To Do'
+    status_name = fields.get("status", {}).get("name", "").lower()
+    print(f"[JIRA WEBHOOK] Issue status: {status_name}")
+    if status_name != "to do":
+        print("[JIRA WEBHOOK] Ticket is not in 'To Do' status. Skipping agentic workflow.")
+        return {"status": "ignored", "reason": "not in To Do"}
+
     try:
         # Move ticket to In Progress
         jira_transition_issue(key, "In Progress")
